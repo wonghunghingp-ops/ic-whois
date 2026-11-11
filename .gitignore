@@ -1,0 +1,19 @@
+# 运行态数据库、日志、导出的业务数据与本地凭据（严禁上传至公开仓库）
+__pycache__/
+*.py[cod]
+*$py.class
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+.env
+.env.*
+!.env.example
+credentials*.json
+!examples/credentials.example.json
+secrets*.json
+result/
+runtime_state/
+logs/
+*.log
+.DS_Store

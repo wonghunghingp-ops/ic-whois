@@ -1,0 +1,6 @@
+example.com
+example.net
+example.cn
+example.cc
+127.0.0.1
+中文测试.cn
