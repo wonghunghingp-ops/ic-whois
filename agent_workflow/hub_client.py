@@ -273,8 +273,13 @@ def classify_http_error(
     try:
         parsed = json.loads(body_text)
         if isinstance(parsed, dict):
-            code = clean_text(parsed.get("code") or parsed.get("error") or code)
-            msg = clean_text(parsed.get("message") or parsed.get("error_description") or "")
+            err_nested = parsed.get("error")
+            if isinstance(err_nested, dict):
+                code = clean_text(err_nested.get("code") or parsed.get("code") or code)
+                msg = clean_text(err_nested.get("message") or parsed.get("message") or "")
+            else:
+                code = clean_text(parsed.get("code") or err_nested or code)
+                msg = clean_text(parsed.get("message") or parsed.get("error_description") or "")
     except Exception:
         pass
 
