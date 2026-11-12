@@ -22,8 +22,8 @@ cp .env.example .env
 ```
 
 > **预期结果**：
-> - 若配置了 Token：打印 `Domain Hub 就绪检查通过` 以及 `Collector 身份认证通过: id=... scopes=... providers=...`。
-> - 若未配置 Token：提示将使用匿名 `/v1/intake` 通道（每次 <=20 条，间隔 >=16s）。
+> - 若配置了 Token：打印 `Domain Hub 就绪检查通过` 以及 `Collector 身份认证通过: id=... scopes=... providers=...`，全量上传、游标检索、导出与抢单均可用。
+> - 若未配置 Token：提示已就绪使用**免令牌全量批量上传通道**（`batches -> files -> PUT -> observations:batch`），可直接执行 `clean-icp`、`ingest-icp`、`probe-whois`、`sync-whois`；仅 `pull-missing` / `--from-hub` / `job-worker` 仍需 Token。
 
 ---
 
@@ -45,8 +45,8 @@ cp .env.example .env
 # 如希望只提取高价值 666 网站分号记录，追加 --require-666
 
 # 第二步：将清洗后 ICP 数据上传至 Domain Hub
-# - 有 Token 时走方案 B（归档 source_input 原件 + 幂等 icp 观测）
-# - 无 Token 时可显式指定 --mode intake 走匿名通道
+# - 默认（--mode auto / batch）免 Token 也可走完整批次原件归档（batches -> files -> PUT -> observations:batch）
+# - 若只想轻量入库不留原件文件，可显式指定 --mode intake（单批最多 800 条、无间隔延迟）
 ./run.sh ingest-icp \
   --input /path/to/province_raw.csv \
   --province 湖南省 \
@@ -159,9 +159,9 @@ nohup ./run.sh job-worker \
 
 1. **为什么遇到 `403`？**
    - 检查是否是直接用 `curl` 没带 `User-Agent` 测试，或当前 Collector Token 没有配置对应 `provider` 权限（通过 `./run.sh verify` 核对 `providers` 字段）。
-2. **为什么匿名提交很多条变慢了？**
-   - `/v1/intake` 服务端按 `5 次/分钟/IP` 严格限流，且每次最多 20 条，所以本工具默认每隔 16 秒发送 1 批（20 条）属于正常保护行为；批量场景务必申请并使用 Collector Token 走授权通道。
-3. **为什么查完的 `.cn` 域名显示无显式时区警告，是否能入库？**
-   - 可以。CNNIC 43 端口大量返回北京本地无后缀时间字符串，工具已保存原文字节到 JSONL 原件，服务端标记 `official_response_missing_timezone` 后同样计为可信核验并支持完成任务。
+2. **上传大量记录还要配置 Token 吗？如果走 `--mode intake` 还限流吗？**
+   - 批量上传（`ingest-icp`、`sync-whois`）现已全面免除 Token 限制，不配 Token 也能直走完整批次归档并获得 `authoritative = 1` 官方证明；`POST /v1/intake` 也已提升至单次最多 800 条且取消间隔延迟。只有 `pull-missing`、`export-csv --from-hub`、`job-worker` 需要 Token。
+3. **为什么查完的 `.cn` / `.top` / `.vip` 域名也能直接进入官方主表？**
+   - Hub 现已支持 `cnnic_whois` 北京无时区文本（自动按 `+08:00` 转 UTC 并记为 `official_response_missing_timezone`）与 IANA 官方引导表认证的 `registry_rdap`（含 `200` 成功与标准 `404 errorCode=404` 权威未注册证明）直接晋升 `domain_current`，且 `imported`/`legacy_catalog` 永不遮蔽官方结果。
 4. **公共 Git 提交前注意什么？**
    - `git status` 确保看不到 `.env`、真实 `credentials.json`、`runtime_state/` 和 `result/`；`.gitignore` 已默认屏蔽上述目录与密钥后缀。

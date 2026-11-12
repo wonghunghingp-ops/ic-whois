@@ -3,11 +3,10 @@
 Supports:
 - Mandatory custom User-Agent (avoids edge WAF 403 rejections)
 - Direct HTTPS, optional single HTTP CONNECT proxy, or RFC-1928 SOCKS5 proxy
-- Plan A: Anonymous/public `POST /v1/intake` (1..20 records, 5/min/IP pacing, local rejection capture)
-- Plan B: Authorized Collector archive upload (`batches -> files -> PUT -> observations:batch -> receipts`)
-  with automatic `< 900 KiB` JSONL evidence chunking and SHA-256 verification
-- Cursor search across >5,000 candidates via `POST /v1/candidates/search`
-- Job worker lifecycle (`/v1/jobs:claim`, `/heartbeat`, `/complete`, `/fail`)
+- Plan A: Open bulk `POST /v1/intake` (1..800 records per request, unthrottled, local rejection capture)
+- Plan B (Default, tokenless-ready): Full evidence archive pipeline (`batches -> files -> PUT -> observations:batch -> receipts -> complete`)
+  with automatic `< 900 KiB` JSONL evidence chunking and SHA-256 verification (optional Bearer token for collector attribution)
+- Authenticated cursor search across >5,000 candidates (`POST /v1/candidates/search`), exports, and job worker lifecycle (`/v1/jobs:*`)
 """
 
 from __future__ import annotations
@@ -292,7 +291,7 @@ def classify_http_error(
             code=code,
             http_status=status,
             retryable=False,
-            next_step="请检查 .env 中的 DOMAIN_HUB_TOKEN 是否正确，或在无 Token 场景使用匿名通道 /v1/intake。",
+            next_step="请检查 .env 中的 DOMAIN_HUB_TOKEN 是否正确；批量上传（batches/files/observations:batch）也可不带 Token 使用。",
             detail=msg,
         )
     if status == 403:
@@ -323,7 +322,7 @@ def classify_http_error(
             code=code,
             http_status=status,
             retryable=False,
-            next_step="请确认日期为 YYYY-MM-DD、时间戳为 UTC 毫秒格式、单批不超过 100 条 / 850 KiB（/v1/intake 不超过 20 条）。",
+            next_step="请确认日期为 YYYY-MM-DD、时间戳为 UTC 毫秒格式、单批不超过 100 条 / 850 KiB（/v1/intake 不超过 800 条）。",
             detail=msg,
         )
     if status == 429:
@@ -334,7 +333,7 @@ def classify_http_error(
             code=code,
             http_status=status,
             retryable=True,
-            next_step="单线程客户端会自动退避等待后重试；如使用匿名 /v1/intake，请保持单次 <=20 条且间隔 >=16 秒。",
+            next_step="单线程客户端会自动退避等待后重试。",
             detail=msg,
         )
     if status >= 500:
@@ -571,23 +570,27 @@ class DomainHubClient:
         self._opener = build_url_opener(self.proxy_cfg)
         self.outbox = OutboxStore(outbox_path) if outbox_path else None
 
-    def _headers(self, *, auth_required: bool, content_type: str | None = "application/json", idem_key: str | None = None) -> dict[str, str]:
+    def _headers(
+        self,
+        *,
+        auth_required: bool,
+        send_optional_auth: bool = True,
+        content_type: str | None = "application/json",
+        idem_key: str | None = None,
+    ) -> dict[str, str]:
         if auth_required and not self.token:
             raise HubClientError(
-                "当前操作需要 Collector Token，但尚未配置 DOMAIN_HUB_TOKEN。",
+                "当前读取/导出/任务接口需要 Collector Token，但尚未配置 DOMAIN_HUB_TOKEN。",
                 category="permission_error",
                 code="missing_token",
-                next_step="请先在 .env 或 --token 中配置 Collector Token；若无 Token 可改用匿名上传指令。",
+                next_step="请先在 .env 或 --token 中配置 Collector Token；若仅需批量上传 ICP/WHOIS，可直接免 Token 运行。",
             )
         hdrs: dict[str, str] = {
             "User-Agent": self.user_agent,
             "Accept": "application/json",
         }
-        if self.token and auth_required:
+        if self.token and (auth_required or send_optional_auth):
             hdrs["Authorization"] = f"Bearer {self.token}"
-        elif self.token and not auth_required:
-            # Intake also works anonymously when auth_required=False
-            pass
         if content_type:
             hdrs["Content-Type"] = content_type
         if idem_key:
@@ -603,6 +606,7 @@ class DomainHubClient:
         raw_bytes: bytes | None = None,
         content_type: str | None = None,
         auth_required: bool = True,
+        send_optional_auth: bool = True,
         idem_key: str | None = None,
     ) -> tuple[int, bytes, dict[str, str]]:
         if json_body is not None and raw_bytes is not None:
@@ -617,7 +621,12 @@ class DomainHubClient:
             digest = hashlib.sha256(body_data or b"").hexdigest()[:24]
             idem_key = f"aw-{digest}-{uuid.uuid4().hex[:8]}"
 
-        headers = self._headers(auth_required=auth_required, content_type=content_type, idem_key=idem_key)
+        headers = self._headers(
+            auth_required=auth_required,
+            send_optional_auth=send_optional_auth,
+            content_type=content_type,
+            idem_key=idem_key,
+        )
 
         for attempt in range(1, self.max_retries + 1):
             req = urllib.request.Request(full_url, data=body_data, method=method.upper())
@@ -665,6 +674,7 @@ class DomainHubClient:
         raw_bytes: bytes | None = None,
         content_type: str | None = None,
         auth_required: bool = True,
+        send_optional_auth: bool = True,
         idem_key: str | None = None,
     ) -> Any:
         _, raw, _ = self.request_raw(
@@ -674,6 +684,7 @@ class DomainHubClient:
             raw_bytes=raw_bytes,
             content_type=content_type,
             auth_required=auth_required,
+            send_optional_auth=send_optional_auth,
             idem_key=idem_key,
         )
         if not raw:
@@ -710,11 +721,11 @@ class DomainHubClient:
         self,
         records: list[dict[str, Any]],
         *,
-        chunk_size: int = 20,
-        delay_sec: float = 16.0,
+        chunk_size: int = 500,
+        delay_sec: float = 0.0,
     ) -> dict[str, Any]:
         """Validate locally and submit records sequentially to `POST /v1/intake`."""
-        safe_chunk = max(1, min(20, int(chunk_size)))
+        safe_chunk = max(1, min(800, int(chunk_size)))
         valid_rows: list[dict[str, Any]] = []
         locally_invalid: list[dict[str, Any]] = []
 
@@ -759,6 +770,7 @@ class DomainHubClient:
                 "/v1/intake",
                 json_body=payload,
                 auth_required=False,
+                send_optional_auth=False,
                 idem_key=idem_key,
             )
             if self.outbox:
@@ -831,10 +843,14 @@ class DomainHubClient:
         else:
             idem_key = f"batch-{body_sha[:24]}-{uuid.uuid4().hex[:6]}"
 
-        res = self.request_json("POST", "/v1/batches", json_body=payload, auth_required=True, idem_key=idem_key)
+        res = self.request_json("POST", "/v1/batches", json_body=payload, auth_required=False, idem_key=idem_key)
         if self.outbox:
             self.outbox.mark_idem_done(op_key, res)
         return res
+
+    def complete_batch(self, batch_id: str) -> dict[str, Any]:
+        clean_bid = clean_id(batch_id)
+        return self.request_json("POST", f"/v1/batches/{clean_bid}/complete", json_body={}, auth_required=False)
 
     def upload_file_bytes(
         self,
@@ -874,7 +890,7 @@ class DomainHubClient:
         key = "file-" + hashlib.sha256(
             f"{batch_id}:{role}:{original_name}:{digest}".encode("utf-8")
         ).hexdigest()[:32]
-        reg = self.request_json("POST", "/v1/files", json_body=file_meta_req, auth_required=True, idem_key=key)
+        reg = self.request_json("POST", "/v1/files", json_body=file_meta_req, auth_required=False, idem_key=key)
         if reg.get("state") == "verified":
             return reg
 
@@ -885,13 +901,13 @@ class DomainHubClient:
                 upload_url,
                 raw_bytes=content_bytes,
                 content_type=resolved_media,
-                auth_required=True,
+                auth_required=False,
                 idem_key=f"put-{digest[:24]}",
             )
-            return res if res else self.request_json("GET", f"/v1/files/{reg['file_id']}", auth_required=True)
+            return res if res else self.request_json("GET", f"/v1/files/{reg['file_id']}", auth_required=False)
         except HubClientError as err:
             if err.http_status == 409:
-                current = self.request_json("GET", f"/v1/files/{reg['file_id']}", auth_required=True)
+                current = self.request_json("GET", f"/v1/files/{reg['file_id']}", auth_required=False)
                 if current.get("state") == "verified" and current.get("sha256") == digest:
                     return current
             raise
@@ -1029,7 +1045,7 @@ class DomainHubClient:
                 if self.outbox
                 else f"obs-{payload_sha[:28]}"
             )
-            submitted = self.request_json("POST", path, json_body=payload, auth_required=True, idem_key=idem_key)
+            submitted = self.request_json("POST", path, json_body=payload, auth_required=False, idem_key=idem_key)
             receipt_id = submitted["id"]
             if wait_receipts:
                 terminal = self.wait_receipt(receipt_id, timeout_sec=receipt_timeout_sec)
@@ -1062,7 +1078,7 @@ class DomainHubClient:
     def wait_receipt(self, receipt_id: str, *, timeout_sec: float = 120.0, poll_interval: float = 2.0) -> dict[str, Any]:
         deadline = time.monotonic() + timeout_sec
         while True:
-            receipt = self.request_json("GET", f"/v1/ingest-receipts/{receipt_id}", auth_required=True)
+            receipt = self.request_json("GET", f"/v1/ingest-receipts/{receipt_id}", auth_required=False)
             state = clean_text(receipt.get("state"))
             pending = int(receipt.get("pending") or 0)
             if state in ("processed", "partial") and pending == 0:
@@ -1089,7 +1105,7 @@ class DomainHubClient:
         cursor: str | None = "0"
         while cursor is not None:
             q = urllib.parse.quote(str(cursor))
-            page = self.request_json("GET", f"/v1/ingest-receipts/{receipt_id}/items?cursor={q}", auth_required=True)
+            page = self.request_json("GET", f"/v1/ingest-receipts/{receipt_id}/items?cursor={q}", auth_required=False)
             out.extend(page.get("items") or [])
             nxt = page.get("next_cursor")
             cursor = str(nxt) if nxt not in (None, "", "null") else None

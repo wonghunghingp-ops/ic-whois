@@ -4,7 +4,7 @@
 
 - **零第三方依赖**：仅依赖 Python 3.9+ 标准库（无需 `pip install`、无需虚拟环境编译）
 - **严格单线程（非多代理池）**：全链路顺序执行，内置礼貌随机抖动、限流自适应退避、SQLite WAL 断点续传、`SIGINT`/`SIGTERM` 安全落盘
-- **双向严格对齐 Domain Hub v2**：原生适配匿名入口 `POST /v1/intake`（方案 A）与授权证据归档通道 `batches -> files -> PUT -> observations:batch`（方案 B）
+- **双向严格对齐 Domain Hub v2**：原生适配全量证据归档通道 `batches -> files -> PUT -> observations:batch -> complete`（**免 Token 默认启用**）与轻量入口 `POST /v1/intake`（单批支持 1..800 条）
 - **严格防误报**：Verisign 404 校验 `errorCode=404`，CNNIC 43 端口校验精确未注册短语且隔离限流字样，超时/限流/空包绝不误判 `not_found`
 - **合规有序归档**：支持一键拷贝原始资料至 `result/raw_inputs/`，并按过期与删除紧迫程度升序导出 UTF-8 BOM Excel 友好 CSV
 
@@ -21,7 +21,7 @@ agent-workflow/
 ├── agent_workflow/
 │   ├── __init__.py                        # 版本信息
 │   ├── common.py                          # 域名/省份/时间归一化、icpFactHash、lifecycle、CSV 导出
-│   ├── hub_client.py                      # Hub HTTP/SOCKS5 客户端、SQLite Outbox、方案 A/B 上传与游标查询
+│   ├── hub_client.py                      # Hub HTTP/SOCKS5 客户端、SQLite Outbox、免密/授权批量上传与游标查询
 │   ├── icp_cleaner.py                     # 多编码 ICP 清洗、666/665 分级、去重与可选 LLM 补充
 │   ├── whois_single.py                    # 单线程官方 RDAP/CNNIC 43 核验引擎与 SQLite WAL 断点续传
 │   └── cli.py                             # 统一 CLI 子命令入口
@@ -45,7 +45,7 @@ agent-workflow/
 
 ```bash
 cp .env.example .env
-# 按需编辑 .env：填入 DOMAIN_HUB_URL 与 DOMAIN_HUB_TOKEN（若仅用匿名通道可留空 Token）
+# 按需编辑 .env：填入 DOMAIN_HUB_URL；仅批量上传（ingest-icp / sync-whois）时 DOMAIN_HUB_TOKEN 可留空
 ./run.sh verify
 ```
 
@@ -57,7 +57,7 @@ cp .env.example .env
   --input examples/sample_icp.csv \
   --archive-raw --seq 01 --province 样例省份 --desc 备案快照
 
-# ② 上传清洗后的 ICP 数据至 Domain Hub（有 Token 自动走授权归档，无 Token 自动走匿名 /v1/intake）
+# ② 上传清洗后的 ICP 数据至 Domain Hub（免 Token 亦可默认走完整批次原件归档通道）
 ./run.sh ingest-icp \
   --input examples/sample_icp.csv \
   --province 样例省份 --desc "样例批次ICP导入"
@@ -89,9 +89,9 @@ cp .env.example .env
 
 | 子命令 | 用途说明 |
 | :--- | :--- |
-| `verify` | 检测 `DOMAIN_HUB_URL` 连通性、延迟及 Token 节点权限范围 |
+| `verify` | 检测 `DOMAIN_HUB_URL` 连通性、延迟及免密批量通道/Token 节点权限状态 |
 | `clean-icp` | 清洗 CSV/TSV/TXT/JSON/JSONL，归一化域名/省份/日期，`666` 优先排序 |
-| `ingest-icp` | 一键清洗并上传 ICP 数据至 Hub（支持 `authorized` / `intake` / `auto`） |
+| `ingest-icp` | 一键清洗并上传 ICP 数据至 Hub（默认免密直走 `batch`，可选 `intake` / `authorized`） |
 | `pull-missing` | 通过 `POST /v1/candidates/search` 游标拉取缺失官方 WHOIS 或需刷新域名 |
 | `probe-whois` | Linux 单线程顺序核验官方 RDAP / CNNIC 43 端口，结果写入 SQLite WAL 与 JSONL |
 | `sync-whois` | 上传断点库或 JSONL 中的 WHOIS 原件证据与观测记录，回执成功后自动标记已同步 |

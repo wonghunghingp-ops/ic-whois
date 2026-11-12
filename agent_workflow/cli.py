@@ -70,7 +70,8 @@ def _env_float(name: str, default: float) -> float:
 
 def _build_hub_client(args: argparse.Namespace) -> DomainHubClient:
     base_url = clean_text(getattr(args, "hub_url", None) or os.environ.get("DOMAIN_HUB_URL") or "https://hub.llmhubone.net")
-    token = clean_text(getattr(args, "token", None) or os.environ.get("DOMAIN_HUB_TOKEN") or "")
+    raw_tok = getattr(args, "token", None)
+    token = clean_text(raw_tok if raw_tok is not None else (os.environ.get("DOMAIN_HUB_TOKEN") or ""))
     proxy = clean_text(getattr(args, "hub_proxy", None) or os.environ.get("HTTP_PROXY_URL") or "")
     timeout = float(getattr(args, "timeout", None) or _env_float("HUB_HTTP_TIMEOUT", 60.0))
     state_dir = Path(getattr(args, "state_dir", None) or "runtime_state")
@@ -133,10 +134,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
             f"[成功] Collector 身份认证通过：id={me.get('id')} name={me.get('name')} "
             f"scopes={me.get('scopes')} providers={me.get('providers')}"
         )
-        print("下一步建议：可使用 clean-icp / ingest-icp（授权方案 B）、pull-missing、probe-whois、sync-whois、job-worker。")
+        print("下一步建议：可使用 clean-icp / ingest-icp / pull-missing / probe-whois / sync-whois / job-worker。")
     else:
-        print("[提示] 未配置 DOMAIN_HUB_TOKEN，将采用匿名公开通道（方案 A: POST /v1/intake，单次最多 20 条，5 次/分钟/IP）。")
-        print("下一步建议：可使用 clean-icp、probe-whois，并通过 --mode intake 提交数据；如需批量归档与拉取全量缺口，请配置 DOMAIN_HUB_TOKEN。")
+        print("[提示] 未配置 DOMAIN_HUB_TOKEN，已就绪使用免令牌全量批量上传通道（batches -> files -> PUT -> observations:batch，可获得官方 authoritative=1 核验）。")
+        print("下一步建议：可直接免 Token 运行 clean-icp、ingest-icp、probe-whois、sync-whois；如需拉取全量缺口(pull-missing)、导出(--from-hub)或抢单(job-worker)，请再配置 DOMAIN_HUB_TOKEN。")
     return 0
 
 
@@ -194,17 +195,7 @@ def cmd_clean_icp(args: argparse.Namespace) -> int:
 def cmd_ingest_icp(args: argparse.Namespace) -> int:
     input_path = Path(args.input)
     hub = _build_hub_client(args)
-    mode = args.mode
-    if mode == "auto":
-        mode = "authorized" if hub.token else "intake"
-
-    if mode == "authorized" and not hub.token:
-        raise HubClientError(
-            "选择 authorized 授权批量上传模式，但未配置 DOMAIN_HUB_TOKEN。",
-            category="permission_error",
-            code="missing_token",
-            next_step="请设置 DOMAIN_HUB_TOKEN，或改用 --mode intake 走匿名公开通道。",
-        )
+    mode = "batch" if args.mode in ("auto", "batch", "authorized") else "intake"
 
     rows, stats = clean_icp_file(
         input_path,
@@ -227,10 +218,10 @@ def cmd_ingest_icp(args: argparse.Namespace) -> int:
         print(f"[归档] 本地原始输入已归档: {archived}")
 
     if mode == "intake":
-        delay_sec = float(args.intake_delay if args.intake_delay is not None else _env_float("INTAKE_DELAY_SEC", 16.0))
+        delay_sec = float(args.intake_delay if args.intake_delay is not None else _env_float("INTAKE_DELAY_SEC", 0.0))
         intake_records = to_intake_records(rows)
-        print(f"[进行中] 即将通过匿名通道 POST /v1/intake 上传 {len(intake_records)} 条备案记录（每批 <=20 条，间隔 {delay_sec}s）...")
-        res = hub.submit_intake(intake_records, chunk_size=20, delay_sec=delay_sec)
+        print(f"[进行中] 即将通过 /v1/intake 上传 {len(intake_records)} 条备案记录（每批 <=500 条，间隔 {delay_sec}s）...")
+        res = hub.submit_intake(intake_records, chunk_size=500, delay_sec=delay_sec)
         rejected_all = res["locally_invalid"] + res["server_rejected"]
         if rejected_all:
             rej_path = Path(args.state_dir) / "intake_rejected.jsonl"
@@ -272,8 +263,9 @@ def cmd_ingest_icp(args: argparse.Namespace) -> int:
         provider=args.provider or "miit_snapshot",
     )
     summary = hub.submit_observations_batch(batch_id, obs, wait_receipts=not args.no_wait)
+    auth_label = "授权" if hub.token else "免密"
     print(
-        f"[成功] 授权 ICP 批量入库完成（原始 {stats.total_rows} 行，有效 {len(obs)} 条）："
+        f"[成功] {auth_label} ICP 批量入库完成（原始 {stats.total_rows} 行，有效 {len(obs)} 条）："
         f"新增接收={summary['accepted']}，幂等去重={summary['duplicates']}，拒绝={summary['rejected']}。"
     )
     return 0 if summary["rejected"] == 0 else 1
@@ -402,9 +394,7 @@ def cmd_probe_whois(args: argparse.Namespace) -> int:
 
 def cmd_sync_whois(args: argparse.Namespace) -> int:
     hub = _build_hub_client(args)
-    mode = args.mode
-    if mode == "auto":
-        mode = "authorized" if hub.token else "intake"
+    mode = "batch" if args.mode in ("auto", "batch", "authorized") else "intake"
 
     state_dir = Path(args.state_dir)
     checkpoint: WhoisCheckpointStore | None = None
@@ -447,8 +437,8 @@ def cmd_sync_whois(args: argparse.Namespace) -> int:
         if not intake_rows:
             print("[提示] 当前没有包含到期时间/状态/注册商的有效 WHOIS 记录可通过匿名 /v1/intake 上报。")
             return 0
-        delay_sec = float(args.intake_delay if args.intake_delay is not None else _env_float("INTAKE_DELAY_SEC", 16.0))
-        res = hub.submit_intake(intake_rows, chunk_size=20, delay_sec=delay_sec)
+        delay_sec = float(args.intake_delay if args.intake_delay is not None else _env_float("INTAKE_DELAY_SEC", 0.0))
+        res = hub.submit_intake(intake_rows, chunk_size=500, delay_sec=delay_sec)
         print(
             f"[成功] 匿名 WHOIS 投递完成：提交 {res['sent_valid']} 条，接收 {res['accepted_records']} 条，拒绝 {len(res['server_rejected']) + len(res['locally_invalid'])} 条。"
         )
@@ -725,9 +715,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_clean.set_defaults(func=cmd_clean_icp)
 
     # ingest-icp
-    p_ing = sub.add_parser("ingest-icp", help="清洗并上传 ICP 数据到 Domain Hub（支持授权档案模式与匿名 /v1/intake）")
+    p_ing = sub.add_parser("ingest-icp", help="清洗并上传 ICP 数据到 Domain Hub（默认免令牌全量批量归档通道，亦可选 /v1/intake）")
     p_ing.add_argument("--input", required=True, help="原始或已清洗 ICP 文件路径")
-    p_ing.add_argument("--mode", choices=("auto", "authorized", "intake"), default="auto", help="上传通道")
+    p_ing.add_argument("--mode", choices=("auto", "batch", "authorized", "intake"), default="auto", help="上传通道（默认 auto 走全量批量通道）")
     p_ing.add_argument("--province", default="全国", help="省份/主题名")
     p_ing.add_argument("--topic", help="主题名（同 province）")
     p_ing.add_argument("--desc", default="", help="批次说明")
@@ -740,7 +730,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ing.add_argument("--archive-raw", action="store_true", help="同时拷贝原件到本地 result/raw_inputs/")
     p_ing.add_argument("--seq", default="00", help="本地归档序号")
     p_ing.add_argument("--result-dir", default="result")
-    p_ing.add_argument("--intake-delay", type=float, help="匿名 /v1/intake 每批(20条)之间的等待秒数（默认 16）")
+    p_ing.add_argument("--intake-delay", type=float, help="/v1/intake 每批之间的等待秒数（默认 0）")
     p_ing.add_argument("--no-wait", action="store_true", help="提交 observations:batch 后不阻塞等待回执")
     p_ing.set_defaults(func=cmd_ingest_icp)
 
@@ -784,7 +774,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_syn.add_argument("--input", help="直接读取 whois_results.jsonl；省略则自动读取 checkpoint 未上传记录")
     p_syn.add_argument("--checkpoint", help="SQLite WAL 断点库路径")
     p_syn.add_argument("--all-cached", action="store_true", help="重新上传 checkpoint 中全部终态记录（依赖服务端幂等去重）")
-    p_syn.add_argument("--mode", choices=("auto", "authorized", "intake"), default="auto")
+    p_syn.add_argument("--mode", choices=("auto", "batch", "authorized", "intake"), default="auto")
     p_syn.add_argument("--topic", default="WHOIS官方核验")
     p_syn.add_argument("--province", help="同 topic")
     p_syn.add_argument("--desc", default="")

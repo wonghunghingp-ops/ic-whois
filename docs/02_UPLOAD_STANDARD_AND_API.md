@@ -8,11 +8,12 @@
 
 | 维度 | 上一版 (v1) | 当前线上版 (v2) | 对 Agent 实操的影响 |
 | :--- | :--- | :--- | :--- |
-| **开放上传模式 (`/v1/intake`)** | 单一松散接收 | 拆分为 **方案 A 匿名严格校验入口** 与 **方案 B 授权原件证据通道**，并有明确字段 `.strict()` 约束 | 无 Token 也可上报，但匿名入口每次限 `1..20` 条、每 IP `5次/分`，未知字段会整批 `422` 拒收 |
+| **开放上传模式 (`/v1/intake`)** | 单一松散接收（原限 1..20 条、5次/分/IP） | 放开大批量投递上限（**单次 `1..800` 条、取消限频**）且与严格 `.strict()` 校验并存 | 无需等待即可高吞吐补录线索；未知字段仍会整批 `422` 拒收，需用 `validate_intake_record()` 预校验 |
 | **字段精准命名 (`/v1/intake`)** | 部分脚本混用 `nature`、`statuses`、`provider` | `/v1/intake` 的 `icp` 对象必须用 `subject_type`（非 `nature`），`whois` 对象必须用 `status`（字符串，非数组），顶层不接受 `provider`/`kind` | 强烈建议使用本仓库 `validate_intake_record()` 预校验再发送 |
 | **部分拒收隔离 (`/v1/intake`)** | 报错常整批失败 | 单行格式/时间错误返回部分成功 `{accepted_records, accepted_observations, rejected: [{index, code, message}]}` | 客户端无需因个别脏行重传全批，仅需将 `rejected` 落盘待修正 |
-| **授权上传原件校验 (方案 B)** | 部分状态直接采信 | `POST /v1/observations:batch` 对官方 WHOIS 严格比对 JSONL 原件 `endpoint`、`http_status`、`observed_at` 毫秒字符串和 `response_sha256` | CNNIC 43 端口无 HTTP 状态码，**JSONL 与 observation 两边都必须省略 `http_status`** |
-| **CNNIC 无时区放行** | 无明确标记或易失败 | 当 `whois.cnnic.cn:43` 原文缺少时区时，服务端记为 `official_response_missing_timezone` 并允许计入有效完成状态 | 上传 verbatim 原文即可被 Hub 与 `jobs/{id}/complete` 正确接受 |
+| **批量原件归档免 Token (方案 B)** | 方案 B 必须携带 Bearer Token | `batches -> files -> PUT -> observations:batch -> complete` 整条批量写链路支持**免 Token 匿名直传**（路由至 `__open_batch__`）；若带 Bearer Token 则按授权节点归属 | `ingest-icp` 与 `sync-whois` 无需 Token 即可直接归档原件、提交官方 WHOIS 并晋升主表；读/查/导/抢单接口仍受 Token 保护 |
+| **官方证据全后缀直通 (`domain_current`)** | 仅 `verisign_rdap` 晋升主表，且 `cnnic_whois` 无时区/未知后缀常留历史库 | `verisign_rdap`、`cnnic_whois`（补齐无后缀北京时间 `+08:00` 及 `not_found`）与 IANA 官方引导表校验通过的 `registry_rdap`（HTTP `200`/`404`）均直接晋升 `authoritative=1` 主表 | `.cn` / `.top` / `.vip` / `.xyz` 等通用后缀一次上传即完成权威入库；`evidence_scope=all` 下 `imported`/`legacy_catalog` 永不遮蔽官方主记录 |
+| **原件校验与 CNNIC 无时区** | 部分状态直接采信 | `POST /v1/observations:batch` 对官方 WHOIS 严格比对 JSONL 原件 `endpoint`、`http_status`、`observed_at` 毫秒字符串和 `response_sha256` | CNNIC 43 端口无 HTTP 状态码，**JSONL 与 observation 两边都必须省略 `http_status`**；无时区北京文本服务端按 `+08:00` 转 UTC 并记为 `official_response_missing_timezone` |
 | **全量缺口检索** | 受 5,000 上限或浅分页制约 | `POST /v1/candidates/search` 支持快照游标分页 `cursor`（`next_cursor`）及全套 `whois_coverage` / `evidence_scope` / `has_service_subid` 过滤 | 支持大于 5,000 条缺口域名的无遗漏全量拉取（推荐客户端 `timeout >= 60s`） |
 | **边缘 WAF 校验** | 默认透传 | 边缘防护屏蔽空/默认 `Python-urllib` UA（直接返回 `403`） | 所有请求必须显式携带自定义 `User-Agent` |
 
@@ -24,16 +25,16 @@
 > - `User-Agent`: 必填非默认值（本工具统一使用 `agent-workflow/2.0 (...)`）
 > - `Content-Type`: `application/json; charset=utf-8`（`PUT /v1/files/{id}/content` 上传原件字节除外）
 > - `Idempotency-Key`: 所有 `POST` 写操作建议携带唯一且稳定的幂等键（同键同包重放安全；同键异包触发 `409`）
-> - `Authorization`: `Bearer <DOMAIN_HUB_TOKEN>`（方案 B 与检索/导出/队列接口必填）
+> - `Authorization`: `Bearer <DOMAIN_HUB_TOKEN>`（**批量上传通道 A/B 均已免 Token，可选填写**；仅检索/导出/队列/原件下载等受保护接口必填；注意若带入无效/格式错误 Bearer 头仍会返回 `401`）
 
-### 方案 A：匿名 / 轻量投递通道 (`POST /v1/intake`)
+### 方案 A：免密大批量轻量入口 (`POST /v1/intake`)
 
-适合没有申请 Collector Token 的 Agent 快速补充线索，或在受限环境下投递少量更新。
+适合仅持有结构化 ICP/基础线索、无需额外上传原始 JSONL 原件的快速补录场景。
 
-- **硬性限额**：
-  - 单次请求 `records` 数组长度 **`1 ~ 20` 条**；
+- **吞吐上限**：
+  - 单次请求 `records` 数组长度 **`1 ~ 800` 条**（本工具默认 `chunk_size=500, delay_sec=0.0`）；
   - **禁止**传 `batch_id` 与 `file_id`（开放入口不接原件归档）；
-  - 限流：**单 IP 每分钟最多 5 次请求，全站每分钟最多 40 次请求**（推荐批间隔 `>= 16s`）。
+  - 已解除单 IP `5次/分` 限频，可按需求连续顺序上传。
 - **请求体严格结构 (`rowSchema.strict()`)**：
   ```json
   {
@@ -81,9 +82,9 @@
 
 ---
 
-### 方案 B：授权 Collector 证据归档通道（正式环境推荐）
+### 方案 B：全量批次证据归档通道（默认启用，免 Token 即可使用）
 
-适用于持有 `DOMAIN_HUB_TOKEN` 的正规采集 Agent，可使 WHOIS 结果获得 **`authoritative = 1` 官方证明**，并保留可溯源原件。
+**现在无需预先申请 `DOMAIN_HUB_TOKEN` 即可跑通完整 5 步原件归档流水线**（未传 `Authorization` 时自动归属内部免密采集槽位 `__open_batch__`；若配置了 Token 则按所属 Collector 归档并同时解锁查询/导出/抢单）。凡带有效公式原件的 `verisign_rdap` / `cnnic_whois` / 受 IANA 官方引导认证的 `registry_rdap` 结果，均可直接获得 **`authoritative = 1` 官方证明** 并晋升主表 `domain_current`。
 
 #### 标准 5 步流水线
 1. **建批次**：`POST /v1/batches`
@@ -109,10 +110,11 @@
      2. `entry.observed_at` 与 `record.observed_at` 经标准化后的 UTC ISO 字符串（`.mmmZ`）必须完全一致；
      3. 若为 HTTPS RDAP（`verisign_rdap` / `registry_rdap`），`entry.http_status` 与 `record.evidence.http_status` 必须同为整数（如 `200` 或 `404`）；若为端口 43 WHOIS（`cnnic_whois`），**两边必须同时省略或设为 null**；
      4. `record.evidence.response_sha256` 必须等于 `SHA256_HEX(utf8(entry.response_text))`。
-5. **等待异步回执终态**：
+5. **等待异步回执终态并闭环批次**：
    - `POST /v1/observations:batch` 返回 HTTP `202` 与 `receipt_id`（服务端按每 3 条一微批异步消化）；
    - 轮询 `GET /v1/ingest-receipts/{receipt_id}` 直至 `state in ("processed", "partial")` 且 `pending == 0`；
-   - 通过 `GET /v1/ingest-receipts/{receipt_id}/items?cursor=0` 核查每条的 `accepted` / `duplicate` / `rejected` 明细。
+   - 通过 `GET /v1/ingest-receipts/{receipt_id}/items?cursor=0` 核查每条的 `accepted` / `duplicate` / `rejected` 明细；
+   - 最后可调用 `POST /v1/batches/{batch_id}/complete` 将批次标记为完结。
 
 ---
 
@@ -140,7 +142,7 @@
 
 | HTTP 状态 / 场景 | 分类 | 常见错误码 | 工具默认策略与 Agent 下一步行动 |
 | :--- | :--- | :--- | :--- |
-| **401 Unauthorized** | `permission_error` | `unauthorized` / `missing_token` | 立即停止（不可重试）；核对 `.env` 中的 `DOMAIN_HUB_TOKEN`，无 Token 请改用 `--mode intake` |
+| **401 Unauthorized** | `permission_error` | `unauthorized` / `missing_token` | 立即停止（不可重试）；仅检索/导出/队列接口或携带了错误 Bearer 头时触发；批量上传可清空无效 Token 直接免密提交 |
 | **403 Forbidden** | `permission_error` | `provider_forbidden` / WAF 拦截 | 立即停止；检查是否缺少自定义 `User-Agent`，或联系管理员给节点授权对应 `provider` |
 | **409 Conflict** | `input_error` | `idempotency_conflict` | `PUT /files/{id}/content` 遇到时会自动核查远端 SHA-256；其他接口需更换 `client_batch_ref` 或新 `event_id` |
 | **400 / 413 / 415 / 422** | `input_error` | `invalid_input` / `evidence_metadata` / `future_observation` / `record_too_large` | 本地预校验已拦截 95% 异常；如被服务端退回 `/v1/intake rejected` 列表，自动保存 `runtime_state/intake_rejected.jsonl` 不丢数据 |

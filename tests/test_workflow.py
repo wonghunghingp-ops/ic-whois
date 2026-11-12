@@ -377,6 +377,7 @@ class _MockHubState:
         self.job_claimed = False
         self.job_completed_receipt: str | None = None
         self.rdap_base = ""
+        self.request_auth_log: list[tuple[str, str | None]] = []
 
 
 def _make_mock_handler(state: _MockHubState):
@@ -495,7 +496,13 @@ def _make_mock_handler(state: _MockHubState):
                 )
                 return
 
-            if self.headers.get("Authorization") != "Bearer test-token":
+            auth_hdr = self.headers.get("Authorization")
+            state.request_auth_log.append((path, auth_hdr))
+            if path in ("/v1/batches", "/v1/files", "/v1/observations:batch") or (path.startswith("/v1/batches/") and path.endswith("/complete")):
+                if auth_hdr is not None and auth_hdr != "Bearer test-token":
+                    self._send_json(401, {"code": "unauthorized"})
+                    return
+            elif auth_hdr != "Bearer test-token":
                 self._send_json(401, {"code": "unauthorized"})
                 return
 
@@ -504,6 +511,15 @@ def _make_mock_handler(state: _MockHubState):
                 res = {"id": bid, "batch_id": bid, "display_seq": len(state.batches) + 1, **body}
                 state.batches[bid] = res
                 self._send_json(201, res)
+                return
+
+            if path.startswith("/v1/batches/") and path.endswith("/complete"):
+                bid = path.split("/")[3]
+                if bid not in state.batches:
+                    self._send_json(404, {"code": "batch_not_found"})
+                    return
+                state.batches[bid]["state"] = "complete"
+                self._send_json(200, {"batch_id": bid, "state": "complete"})
                 return
 
             if path == "/v1/files":
@@ -627,6 +643,13 @@ class TestHubIntegrationAndCli(unittest.TestCase):
             self.assertEqual(len(res["server_rejected"]), 1)
             rejected_saved = hub.outbox.list_rejected_intake()
             self.assertEqual(len(rejected_saved), 2)
+
+            # Verify >20 records chunking succeeds in a single /v1/intake request (server limit lifted to 800)
+            bulk_records = [{"domain": f"bulk{i}.com", "icp": {"subject": f"企业{i}"}} for i in range(25)]
+            before_intake_calls = self.state.intake_calls
+            res_bulk = hub.submit_intake(bulk_records)
+            self.assertEqual(res_bulk["accepted_records"], 25)
+            self.assertEqual(self.state.intake_calls - before_intake_calls, 1)
 
             # Verify 409 idempotency_conflict classification
             with self.assertRaises(HubClientError) as ctx:
@@ -840,6 +863,94 @@ class TestHubIntegrationAndCli(unittest.TestCase):
             )
             self.assertEqual(rc, 0)
             self.assertEqual(len(ckpt.list_results(only_unuploaded=True)), 0)
+
+    def test_tokenless_batch_upload_cli_and_complete_batch(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            empty_env = Path(tmp) / "missing.env"
+            clean_env = {k: v for k, v in os.environ.items() if k != "DOMAIN_HUB_TOKEN"}
+
+            with patch.dict(os.environ, clean_env, clear=True):
+                # verify without token should succeed and guide tokenless batch pipeline
+                rc = cli_main(["--env-file", str(empty_env), "--hub-url", self.base_url, "--state-dir", str(state_dir), "verify"])
+                self.assertEqual(rc, 0)
+
+                # pull-missing / collector_me without token must still fail clearly with missing_token
+                hub_no_tok = DomainHubClient(self.base_url, token="", timeout_sec=10.0)
+                with self.assertRaises(HubClientError) as ctx:
+                    hub_no_tok.search_candidates_page({"evidence_scope": "all"})
+                self.assertEqual(ctx.exception.code, "missing_token")
+                with self.assertRaises(HubClientError) as ctx_me:
+                    hub_no_tok.collector_me()
+                self.assertEqual(ctx_me.exception.code, "missing_token")
+
+                # ingest-icp with NO token and auto mode must use full batch pipeline (NOT /v1/intake)
+                rc = cli_main(
+                    [
+                        "--env-file",
+                        str(empty_env),
+                        "--hub-url",
+                        self.base_url,
+                        "--state-dir",
+                        str(state_dir),
+                        "ingest-icp",
+                        "--input",
+                        str(REPO_ROOT / "examples" / "sample_icp.csv"),
+                        "--province",
+                        "免密省",
+                    ]
+                )
+                self.assertEqual(rc, 0)
+                self.assertEqual(self.state.intake_calls, 0)
+                self.assertGreaterEqual(len(self.state.batches), 1)
+                self.assertGreaterEqual(len(self.state.files), 1)
+
+                # sync-whois with NO token must upload evidence JSONL + observations via batch pipeline
+                ckpt = WhoisCheckpointStore(state_dir / "whois_checkpoint.db")
+                raw_whois = "Domain Name: openbatch.cn\nExpiration Time: 2027-03-01 08:00:00\n"
+                ckpt.upsert(
+                    {
+                        "domain": "openbatch.cn",
+                        "provider": "cnnic_whois",
+                        "endpoint": "whois.cnnic.cn:43",
+                        "outcome": "success",
+                        "http_status": None,
+                        "observed_at": "2026-11-12T01:00:00.000Z",
+                        "expiration_date": "2027-02-28T16:00:00.000Z",
+                        "creation_date": "2020-01-01T00:00:00.000Z",
+                        "registrar": "OpenReg",
+                        "statuses": ["ok"],
+                        "data": {"expiration_date": "2027-02-28T16:00:00.000Z"},
+                        "response_text": raw_whois,
+                        "response_sha256": hashlib.sha256(raw_whois.encode("utf-8")).hexdigest(),
+                    }
+                )
+                rc = cli_main(
+                    [
+                        "--env-file",
+                        str(empty_env),
+                        "--hub-url",
+                        self.base_url,
+                        "--state-dir",
+                        str(state_dir),
+                        "sync-whois",
+                        "--topic",
+                        "免密WHOIS同步",
+                    ]
+                )
+                self.assertEqual(rc, 0)
+                self.assertEqual(self.state.intake_calls, 0)
+                self.assertEqual(len(ckpt.list_results(only_unuploaded=True)), 0)
+
+                # Ensure Authorization header was omitted for tokenless batch calls and complete_batch works
+                batch_id = next(iter(self.state.batches.keys()))
+                comp = hub_no_tok.complete_batch(batch_id)
+                self.assertEqual(comp["state"], "complete")
+                self.assertTrue(
+                    all(auth is None for path, auth in self.state.request_auth_log if path.startswith("/v1/batches") or path == "/v1/files" or path == "/v1/observations:batch")
+                )
 
 
 if __name__ == "__main__":
